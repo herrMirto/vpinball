@@ -69,15 +69,7 @@ protected:
 
    bool initWinsock()
    {
-      #ifdef _WIN32
-         WSADATA wsaData;
-         int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-         if (iResult != 0)
-         {
-            sprintf_s(_message, sizeof(_message), "WSAStartup() failed with error: %d\n", iResult);
-            return false;
-         }
-      #endif
+      // Winsock initialization is handled by PluginLoad/PluginUnload
       return true;
    }
 
@@ -845,20 +837,11 @@ JsonValue* SimpleJsonParser::parseValue() {
 void webSocketServerThread() {
     LOGI("WebSocket server thread starting...");
 
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        LOGE("WSAStartup failed");
-        return;
-    }
-#endif
+    // Winsock initialization is handled by PluginLoad/PluginUnload
 
     wsServerSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (wsServerSocket == INVALID_SOCKET) {
         LOGE("Failed to create WebSocket server socket");
-#ifdef _WIN32
-        WSACleanup();
-#endif
         return;
     }
 
@@ -884,20 +867,24 @@ void webSocketServerThread() {
     serverAddr.sin_port = htons(3131);
 
     if (bind(wsServerSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) {
-        LOGE("Failed to bind WebSocket server to port 3131 (errno: %d)", errno);
-        closesocket(wsServerSocket);
 #ifdef _WIN32
-        WSACleanup();
+        LOGE("Failed to bind WebSocket server to port 3131 (WSAError: %d)", WSAGetLastError());
+#else
+        LOGE("Failed to bind WebSocket server to port 3131 (errno: %d)", errno);
 #endif
+        closesocket(wsServerSocket);
+        wsServerSocket = INVALID_SOCKET;
         return;
     }
 
     if (listen(wsServerSocket, 5) == SOCKET_ERROR) {
-        LOGE("Failed to listen on WebSocket server socket (errno: %d)", errno);
-        closesocket(wsServerSocket);
 #ifdef _WIN32
-        WSACleanup();
+        LOGE("Failed to listen on WebSocket server socket (WSAError: %d)", WSAGetLastError());
+#else
+        LOGE("Failed to listen on WebSocket server socket (errno: %d)", errno);
 #endif
+        closesocket(wsServerSocket);
+        wsServerSocket = INVALID_SOCKET;
         return;
     }
 
@@ -913,8 +900,10 @@ void webSocketServerThread() {
         timeout.tv_usec = 100000;  // 100ms - responsive to new connections
 
         int activity = select(wsServerSocket + 1, &readfds, nullptr, nullptr, &timeout);
-        if (activity < 0) break;
+        if (activity < 0 || !wsServerRunning) break;
         if (activity == 0) continue;
+
+        if (!wsServerRunning) break;  // Check before accept() to avoid operating on closed socket
 
         if (FD_ISSET(wsServerSocket, &readfds)) {
             sockaddr_in clientAddr{};
@@ -1015,6 +1004,28 @@ void webSocketServerThread() {
 
                             LOGI("WebSocket handshake completed, %zu clients connected", clientCount);
 
+                            // Send connection status message so client knows the link is alive
+                            {
+                                bool gameActive = !currentRomName.empty();
+                                int bcastMode = broadcastModeProp_Val;
+                                const char* bcastName = (bcastMode == 1) ? "WebSocket" : (bcastMode == 2) ? "UDP" : (bcastMode == 3) ? "Both" : "Unknown";
+
+                                std::stringstream statusMsg;
+                                statusMsg << "{\"type\":\"connected\","
+                                          << "\"timestamp\":\"" << getTimestamp() << "\","
+                                          << "\"server\":\"score-server\","
+                                          << "\"version\":\"1.0\","
+                                          << "\"broadcastMode\":\"" << bcastName << "\","
+                                          << "\"gameActive\":" << (gameActive ? "true" : "false");
+                                if (gameActive) {
+                                    statusMsg << ",\"rom\":\"" << currentRomName << "\"";
+                                }
+                                statusMsg << addMachineIdField();
+                                statusMsg << "}";
+
+                                sendWebSocketFrame(clientSocket, statusMsg.str());
+                            }
+
                             // Send any queued messages to the new client
                             {
                                 std::lock_guard<std::mutex> queueLock(messageQueueMutex);
@@ -1061,21 +1072,8 @@ void webSocketServerThread() {
         }
     }
 
-    // Cleanup
-    {
-        std::lock_guard<std::mutex> lock(wsClientsMutex);
-        for (SOCKET client : wsClients) {
-            closesocket(client);
-        }
-        wsClients.clear();
-    }
-
-    closesocket(wsServerSocket);
-#ifdef _WIN32
-    WSACleanup();
-#endif
-
-    LOGI("WebSocket server thread stopped");
+    // Socket cleanup is handled by ScoreServerPluginUnload()
+    LOGI("WebSocket server thread exiting");
 }
 
 // Forward declaration
@@ -2668,6 +2666,15 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
     msgApi->RegisterSetting(endpointId, &udpHostProp);
     msgApi->RegisterSetting(endpointId, &udpPortProp);
 
+#ifdef _WIN32
+    // Initialize Winsock on Windows (must be done before any socket operations)
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        LOGE("WSAStartup failed");
+        return;
+    }
+#endif
+
     // Initialize UDP client if UDP mode is enabled
     int broadcastMode = broadcastModeProp_Val;  // 1=WebSocket, 2=UDP, 3=Both
     const char* modeName = (broadcastMode == 1) ? "WebSocket" : (broadcastMode == 2) ? "UDP" : (broadcastMode == 3) ? "Both" : "Unknown";
@@ -2728,15 +2735,6 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
 
     // Subscribe to frame prepare event for periodic current score logging
     msgApi->SubscribeMsg(endpointId, onPrepareFrameId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_EVT_ON_PREPARE_FRAME), onPrepareFrame, nullptr);
-
-#ifdef _WIN32
-    // Initialize Winsock on Windows
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        LOGE("WSAStartup failed");
-        return;
-    }
-#endif
 
     // Start WebSocket server (unless in UDP-only mode)
     if (broadcastMode != 2) {  // Skip WebSocket server in UDP-only mode
